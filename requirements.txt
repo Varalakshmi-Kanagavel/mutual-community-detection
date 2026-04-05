@@ -4,3 +4,4 @@ scipy>=1.10.0
 numpy>=1.24.0
 matplotlib>=3.7.0
 scikit-learn>=1.2.0
+pyvis>=0.3.2          # optional – interactive HTML visualization

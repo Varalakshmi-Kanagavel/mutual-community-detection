@@ -1,69 +1,125 @@
 """Rounding and constraint repair algorithms."""
 import numpy as np
 import scipy.sparse as sp
-from typing import Dict, List, Tuple
+from typing import Optional
 from collections import defaultdict
+from sklearn.cluster import KMeans
 
-def hyperplane_rounding(X: np.ndarray, W: sp.csr_matrix = None, n_trials: int = 100) -> np.ndarray:
+
+def _extract_embedding(X: np.ndarray) -> np.ndarray:
     """
-    Apply Random Hyperplane Rounding to continuous vectors derived from SDP.
-    Since X is the gram matrix (X = V^T V), we first do Cholesky factorization 
-    to obtain V, then use random hyperplanes.
-    
-    This splits the graph into 2 communities.
-    
-    Args:
-        X: Positive semidefinite matrix from SDP (n x n).
-        W: Optional edge weights to evaluate the best cut among trials.
-        n_trials: Number of random hyperplanes to try.
-        
+    Extract embedding vectors V from a PSD gram matrix X (X ≈ V V^T).
+    Uses eigendecomposition so it is always numerically stable.
+
     Returns:
-        np.ndarray: Array of cluster labels (0 or 1).
+        V: (n, n) matrix of row-embedding vectors.
     """
     n = X.shape[0]
-    
-    # Ensure X is positive semi-definite and symmetric
-    X = (X + X.T) / 2
-    
-    # Small eigenvalue bump for numerical stability of Cholesky
-    try:
-        V = np.linalg.cholesky(X + np.eye(n) * 1e-6)
-    except np.linalg.LinAlgError:
-        # Fallback to Eigendecomposition if Cholesky fails
-        eigenvalues, eigenvectors = np.linalg.eigh(X)
-        # Keep positive eigenvalues
-        eigenvalues[eigenvalues < 0] = 0
-        V = eigenvectors @ np.diag(np.sqrt(eigenvalues))
-        
-    best_labels = None
-    best_score = float('-inf')
-    W_dense = W.toarray() if W is not None else None
-    
-    for _ in range(n_trials):
-        # Sample random Gaussian vector
-        g = np.random.randn(n)
-        
-        # Compute projection V * g
-        projection = V @ g
-        
-        # Assign clusters based on sign
-        labels = (projection >= 0).astype(int)
-        
-        # If no weighted matrix is given, just return the first trial
-        if W is None:
-            return labels
-            
-        # Optional: evaluate cut score (tightness) to pick the best rounding
-        # For simplicity, we want to maximize weights within same cluster
-        # Score = sum_{i,j} W_ij * (1 if label_i == label_j else 0)
-        same_cluster_mask = labels[:, None] == labels[None, :]
-        score = np.sum(W_dense[same_cluster_mask])
-        
-        if score > best_score:
-            best_score = score
-            best_labels = labels
-            
-    return best_labels
+    X = (X + X.T) / 2  # enforce symmetry
+    eigenvalues, eigenvectors = np.linalg.eigh(X)
+    eigenvalues = np.clip(eigenvalues, 0, None)          # project to PSD cone
+    V = eigenvectors @ np.diag(np.sqrt(eigenvalues))    # V s.t. V V^T ≈ X
+    return V
+
+
+def hyperplane_rounding(
+    X: np.ndarray,
+    k: int = 2,
+    W: Optional[sp.csr_matrix] = None,
+    n_trials: int = 10,
+    random_state: int = 42,
+) -> np.ndarray:
+    """
+    K-way rounding of an SDP gram matrix X into exactly k communities.
+
+    Strategy
+    --------
+    1. Extract embedding vectors V from X via eigendecomposition.
+    2. Run KMeans(n_clusters=k) on the rows of V to obtain k-way labels.
+    3. Retry with different random seeds until exactly k unique labels are
+       produced (up to n_trials attempts).
+
+    Fallback
+    --------
+    If KMeans cannot produce k clusters (e.g. degenerate embeddings),
+    the function falls back to iterative random-seed restarts and then,
+    if still failing, to a spectral reassignment of small clusters.
+
+    Args:
+        X: Positive semidefinite gram matrix from SDP (n × n).
+        k: Desired number of communities (must be >= 2).
+        W: Unused – kept for backward-compatible call signature.
+        n_trials: Number of KMeans restarts to try before fallback.
+        random_state: Base random seed.
+
+    Returns:
+        np.ndarray: Integer labels in 0 … k-1, length n.
+    """
+    n = X.shape[0]
+    if k < 2:
+        raise ValueError(f"k must be >= 2, got {k}")
+    if k > n:
+        raise ValueError(f"k={k} cannot exceed number of nodes n={n}")
+
+    V = _extract_embedding(X)
+
+    labels = None
+    for attempt in range(n_trials):
+        seed = random_state + attempt
+        km = KMeans(n_clusters=k, n_init=10, random_state=seed)
+        candidate = km.fit_predict(V)
+        if len(set(candidate)) == k:
+            labels = candidate
+            break
+
+    # ── Fallback: force exactly k clusters by splitting/merging ──────────
+    if labels is None or len(set(labels)) != k:
+        print(
+            f"  Warning: KMeans did not produce {k} clusters after "
+            f"{n_trials} attempts. Applying spectral fallback."
+        )
+        labels = _force_k_clusters(V, k, random_state=random_state)
+
+    # ── Validation ───────────────────────────────────────────────────────
+    assert len(set(labels)) == k, (
+        f"Rounding produced {len(set(labels))} clusters but expected {k}."
+    )
+
+    # Relabel to 0 … k-1 (KMeans already does this, but be safe)
+    unique = sorted(set(labels))
+    remap = {old: new for new, old in enumerate(unique)}
+    labels = np.array([remap[l] for l in labels], dtype=int)
+
+    return labels
+
+
+def _force_k_clusters(V: np.ndarray, k: int, random_state: int = 0) -> np.ndarray:
+    """
+    Guarantee exactly k clusters by iteratively splitting the largest cluster
+    until we have k, using KMeans sub-clustering.
+    """
+    n = V.shape[0]
+    labels = np.zeros(n, dtype=int)   # start with 1 big cluster
+    next_label = 1
+
+    while len(set(labels)) < k:
+        # Find the largest cluster to split
+        unique, counts = np.unique(labels, return_counts=True)
+        biggest = unique[np.argmax(counts)]
+        idx = np.where(labels == biggest)[0]
+
+        if len(idx) < 2:
+            break  # cannot split further
+
+        sub_km = KMeans(n_clusters=2, n_init=10, random_state=random_state)
+        sub_labels = sub_km.fit_predict(V[idx])
+
+        # Keep one part as `biggest`, relabel the other as `next_label`
+        mask_new = sub_labels == 1
+        labels[idx[mask_new]] = next_label
+        next_label += 1
+
+    return labels
 
 def get_community_centroids(W: sp.csr_matrix, labels: np.ndarray, k: int) -> np.ndarray:
     """

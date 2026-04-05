@@ -10,7 +10,7 @@ from mutual_community.sdp import solve_sdp
 from mutual_community.spectral import spectral_partition
 from mutual_community.rounding import hyperplane_rounding, repair_sizes
 from mutual_community.evaluation import evaluate_all
-from mutual_community.visualisation import draw_communities
+from mutual_community.visualisation import draw_communities, draw_communities_pyvis
 
 def parse_args():
     parser = argparse.ArgumentParser(description="VPC-based Mutual Community Detection")
@@ -22,8 +22,19 @@ def parse_args():
     parser.add_argument("--smin", type=int, default=None, help="Minimum community size")
     parser.add_argument("--smax", type=int, default=None, help="Maximum community size")
     parser.add_argument("--no-plot", action="store_true", help="Disable interactive plotting")
-    parser.add_argument("--save-plot", type=str, default=None, help="Path to save the plot")
-    
+    parser.add_argument("--save-plot", type=str, default="output.png", help="Path to save the static PNG (default: output.png)")
+    parser.add_argument("--save-html", type=str, default=None, help="Path to save an interactive pyvis HTML file")
+    parser.add_argument("--layout", choices=["spring", "kamada_kawai"], default="spring",
+                        help="Graph layout algorithm (default: spring)")
+    parser.add_argument("--spring-k", type=float, default=None,
+                        help="Repulsion factor for spring layout (default: auto)")
+    parser.add_argument("--node-scale", type=float, default=50.0,
+                        help="Multiplier for node size based on degree (default: 50)")
+    parser.add_argument("--edge-alpha", type=float, default=0.35,
+                        help="Edge opacity 0–1 (default: 0.35)")
+    parser.add_argument("--label-threshold", type=int, default=3,
+                        help="Show labels only for nodes with degree > this value (default: 3)")
+
     return parser.parse_args()
 
 def main():
@@ -55,8 +66,8 @@ def main():
         try:
             X = solve_sdp(W, k=args.k, alpha=args.alpha)
             # 4. Rounding
-            print(f"\n[4/5] Applying Random Hyperplane Rounding...")
-            labels = hyperplane_rounding(X, W=W, n_trials=100)
+            print(f"\n[4/5] Applying KMeans Rounding (k={args.k})...")
+            labels = hyperplane_rounding(X, k=args.k, W=W)
         except Exception as e:
             print(f"      SDP failed ({e}). Fallback to spectral...")
             labels = spectral_partition(W, k=args.k)
@@ -75,22 +86,44 @@ def main():
     for k, v in metrics.items():
         print(f"      {k}: {v:.4f}")
         
-    # Visualization
+    # ── Static matplotlib visualization ─────────────────────────────────────
     if not args.no_plot or args.save_plot:
-        print(f"\n      Generating visualization...")
-        title = f"Communities ({args.method.upper()}) | Modularity: {metrics['Modularity']:.2f}"
-        
-        # Disable interactive mode warning if running from script
+        print(f"\n      Generating static visualization...")
+
+        # Switch backend to Agg when display is disabled
         import matplotlib
         if args.no_plot:
             matplotlib.use('Agg')
-            
+
         draw_communities(
-            G, labels, 
-            title=title, 
-            save_path=args.save_plot, 
-            showplot=not args.no_plot
+            G, labels,
+            k=args.k,
+            modularity=metrics["Modularity"],
+            method=args.method,
+            save_path=args.save_plot,
+            showplot=not args.no_plot,
+            layout=args.layout,
+            spring_k=args.spring_k,
+            node_scale=args.node_scale,
+            edge_alpha=args.edge_alpha,
+            label_degree_threshold=args.label_threshold,
         )
+
+    # ── Interactive pyvis HTML (optional) ────────────────────────────────────
+    if args.save_html:
+        print(f"\n      Generating interactive HTML visualization...")
+        try:
+            draw_communities_pyvis(
+                G, labels,
+                output_path=args.save_html,
+                k=args.k,
+                modularity=metrics["Modularity"],
+                method=args.method,
+                node_scale=max(args.node_scale / 10.0, 3.0),
+                label_degree_threshold=args.label_threshold,
+            )
+        except ImportError as e:
+            print(f"      [warning] {e}")
         
     print("\nDone.")
 
